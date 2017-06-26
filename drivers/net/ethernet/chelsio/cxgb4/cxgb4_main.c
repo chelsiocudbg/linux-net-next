@@ -58,6 +58,7 @@
 #include <linux/sockios.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
+#include <linux/crash_dump.h>
 #include <net/neighbour.h>
 #include <net/netevent.h>
 #include <net/addrconf.h>
@@ -1621,7 +1622,7 @@ void cxgb4_get_tcp_stats(struct pci_dev *pdev, struct tp_tcp_stats *v4,
 	struct adapter *adap = pci_get_drvdata(pdev);
 
 	spin_lock(&adap->stats_lock);
-	t4_tp_get_tcp_stats(adap, v4, v6);
+	t4_tp_get_tcp_stats(adap, v4, v6, false);
 	spin_unlock(&adap->stats_lock);
 }
 EXPORT_SYMBOL(cxgb4_get_tcp_stats);
@@ -3512,6 +3513,21 @@ static struct fw_info *find_fw_info(int chip)
 	return NULL;
 }
 
+#define DUMP_BUF_SIZE (2 * 1024 * 1024)
+static int panic_notify(struct notifier_block *this, unsigned long event,
+                       void *ptr)
+{
+	struct adapter *adap = container_of(this, struct adapter, panic_nb);
+
+	dev_info(adap->pdev_dev, "Initialized cxgb4 crash handler");
+	adap->flags |= K_CRASH;
+
+	do_collect(adap, adap->dump_buf, DUMP_BUF_SIZE);
+	dev_info(adap->pdev_dev, "cxgb4 debug collection succeeded..");
+
+	return NOTIFY_DONE;
+}
+
 /*
  * Phase 0 of initialization: contact FW, obtain config, perform basic init.
  */
@@ -3999,7 +4015,28 @@ static int adap_init0(struct adapter *adap)
 	}
 	t4_init_sge_params(adap);
 	adap->flags |= FW_OK;
-	t4_init_tp_params(adap);
+	t4_init_tp_params(adap, true);
+
+	/* cudbg feature is only supported for T5/T6 cards for now */
+	if (CHELSIO_CHIP_VERSION(adap->params.chip) >= CHELSIO_T5) {
+		adap->dump_buf = kvzalloc(DUMP_BUF_SIZE, GFP_KERNEL);
+
+		if (!adap->dump_buf)
+			dev_err(adap->pdev_dev,
+			"Not enough memory for debug buffers.\n"
+			"Continuing without crash debug collection.");
+		else {
+			dev_info(adap->pdev_dev,
+				 "Registering cxgb4 panic handler.., "
+				 "Buffer start address = %p", adap->dump_buf);
+			adap->panic_nb.notifier_call = panic_notify;
+			adap->panic_nb.priority = INT_MAX;
+
+			atomic_notifier_chain_register(&panic_notifier_list,
+						       &adap->panic_nb);
+		}
+	}
+
 	return 0;
 
 	/*
@@ -4198,6 +4235,7 @@ static void cfg_queues(struct adapter *adap)
 	if (q10g > netif_get_num_default_rss_queues())
 		q10g = netif_get_num_default_rss_queues();
 
+	/* Reduce memory usage in kdump environment by using only one queue */
 	if (is_kdump_kernel())
 		q10g = 1;
 
@@ -4898,6 +4936,20 @@ static int init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 	if (err)
 		goto out_free_adapter;
 
+	/* If we're in kdump kernel, then collect cudbg logs before
+	 * proceeding further.
+	 */
+	if (is_kdump_kernel() &&
+	    CHELSIO_CHIP_VERSION(adapter->params.chip) >= CHELSIO_T5) {
+		adapter->dump_buf = kvzalloc(DUMP_BUF_SIZE, GFP_KERNEL);
+		if (!adapter->dump_buf) {
+			dev_err(&pdev->dev, "Couldn't allocate buffer for collecting logs.  Continuing.");
+		} else {
+			adapter->flags |= K_CRASH;
+			do_collect(adapter, adapter->dump_buf, DUMP_BUF_SIZE);
+			kvfree(adapter->dump_buf);
+		}
+	}
 
 	if (!is_t4(adapter->params.chip)) {
 		s_qpp = (QUEUESPERPAGEPF0_S +
@@ -5274,6 +5326,12 @@ static void remove_one(struct pci_dev *pdev)
 		pci_release_regions(pdev);
 		kfree(adapter->mbox_log);
 		synchronize_rcu();
+		if (adapter->dump_buf) {
+			kvfree(adapter->dump_buf);
+			atomic_notifier_chain_unregister(&panic_notifier_list,
+							 &adapter->panic_nb);
+		}
+
 		kfree(adapter);
 	}
 #ifdef CONFIG_PCI_IOV

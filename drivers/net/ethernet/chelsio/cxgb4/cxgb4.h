@@ -521,6 +521,7 @@ enum {                                 /* adapter flags */
 	USING_SOFT_PARAMS  = (1 << 6),
 	MASTER_PF          = (1 << 7),
 	FW_OFLD_CONN       = (1 << 9),
+	K_CRASH            = (1 << 10),
 };
 
 enum {
@@ -869,6 +870,9 @@ struct adapter {
 
 	/* TC u32 offload */
 	struct cxgb4_tc_u32_table *tc_u32;
+
+	u32 *dump_buf;
+	struct notifier_block panic_nb;
 };
 
 /* Support for "sched-class" command to allow a TX Scheduling Class to be
@@ -1223,6 +1227,7 @@ void t4_sge_start(struct adapter *adap);
 void t4_sge_stop(struct adapter *adap);
 void cxgb4_set_ethtool_ops(struct net_device *netdev);
 int cxgb4_write_rss(const struct port_info *pi, const u16 *queues);
+void do_collect(struct adapter *adap, void *buf, unsigned long size);
 extern int dbfifo_int_thresh;
 
 #define for_each_port(adapter, iter) \
@@ -1275,6 +1280,12 @@ static inline unsigned int core_ticks_to_us(const struct adapter *adapter,
 	/* add Core Clock / 2 to round ticks to nearest uS */
 	return ((ticks * 1000 + adapter->params.vpd.cclk/2) /
 		adapter->params.vpd.cclk);
+}
+
+static inline unsigned int dack_ticks_to_usec(const struct adapter *adap,
+                                              unsigned int ticks)
+{
+        return (ticks << adap->params.tp.dack_re) / core_ticks_per_usec(adap);
 }
 
 void t4_set_reg_field(struct adapter *adap, unsigned int addr, u32 mask,
@@ -1411,7 +1422,7 @@ unsigned int qtimer_val(const struct adapter *adap,
 
 int t4_init_devlog_params(struct adapter *adapter);
 int t4_init_sge_params(struct adapter *adapter);
-int t4_init_tp_params(struct adapter *adap);
+int t4_init_tp_params(struct adapter *adap, bool sleep_ok);
 int t4_filter_field_shift(const struct adapter *adap, int filter_sel);
 int t4_init_rss_mode(struct adapter *adap, int mbox);
 int t4_init_portinfo(struct port_info *pi, int mbox,
@@ -1425,14 +1436,15 @@ int t4_config_glbl_rss(struct adapter *adapter, int mbox, unsigned int mode,
 int t4_config_vi_rss(struct adapter *adapter, int mbox, unsigned int viid,
 		     unsigned int flags, unsigned int defq);
 int t4_read_rss(struct adapter *adapter, u16 *entries);
-void t4_read_rss_key(struct adapter *adapter, u32 *key);
-void t4_write_rss_key(struct adapter *adap, const u32 *key, int idx);
+void t4_read_rss_key(struct adapter *adapter, u32 *key, bool sleep_ok);
+void t4_write_rss_key(struct adapter *adap, const u32 *key, int idx,
+		      bool sleep_ok);
 void t4_read_rss_pf_config(struct adapter *adapter, unsigned int index,
-			   u32 *valp);
+			   u32 *valp, bool sleep_ok);
 void t4_read_rss_vf_config(struct adapter *adapter, unsigned int index,
-			   u32 *vfl, u32 *vfh);
-u32 t4_read_rss_pf_map(struct adapter *adapter);
-u32 t4_read_rss_pf_mask(struct adapter *adapter);
+			   u32 *vfl, u32 *vfh, bool sleep_ok);
+u32 t4_read_rss_pf_map(struct adapter *adapter, bool sleep_ok);
+u32 t4_read_rss_pf_mask(struct adapter *adapter, bool sleep_ok);
 
 unsigned int t4_get_mps_bg_map(struct adapter *adapter, int idx);
 void t4_pmtx_get_stats(struct adapter *adap, u32 cnt[], u64 cycles[]);
@@ -1462,14 +1474,18 @@ void t4_read_cong_tbl(struct adapter *adap, u16 incr[NMTUS][NCCTRL_WIN]);
 void t4_tp_wr_bits_indirect(struct adapter *adap, unsigned int addr,
 			    unsigned int mask, unsigned int val);
 void t4_tp_read_la(struct adapter *adap, u64 *la_buf, unsigned int *wrptr);
-void t4_tp_get_err_stats(struct adapter *adap, struct tp_err_stats *st);
-void t4_tp_get_cpl_stats(struct adapter *adap, struct tp_cpl_stats *st);
-void t4_tp_get_rdma_stats(struct adapter *adap, struct tp_rdma_stats *st);
-void t4_get_usm_stats(struct adapter *adap, struct tp_usm_stats *st);
+void t4_tp_get_err_stats(struct adapter *adap, struct tp_err_stats *st,
+			 bool sleep_ok);
+void t4_tp_get_cpl_stats(struct adapter *adap, struct tp_cpl_stats *st,
+			 bool sleep_ok);
+void t4_tp_get_rdma_stats(struct adapter *adap, struct tp_rdma_stats *st,
+			  bool sleep_ok);
+void t4_get_usm_stats(struct adapter *adap, struct tp_usm_stats *st,
+		      bool sleep_ok);
 void t4_tp_get_tcp_stats(struct adapter *adap, struct tp_tcp_stats *v4,
-			 struct tp_tcp_stats *v6);
+			 struct tp_tcp_stats *v6, bool sleep_ok);
 void t4_get_fcoe_stats(struct adapter *adap, unsigned int idx,
-		       struct tp_fcoe_stats *st);
+		       struct tp_fcoe_stats *st, bool sleep_ok);
 void t4_load_mtus(struct adapter *adap, const unsigned short *mtus,
 		  const unsigned short *alpha, const unsigned short *beta);
 
@@ -1581,4 +1597,24 @@ void free_rspq_fl(struct adapter *adap, struct sge_rspq *rq, struct sge_fl *fl);
 void free_tx_desc(struct adapter *adap, struct sge_txq *q,
 		  unsigned int n, bool unmap);
 void free_txq(struct adapter *adap, struct sge_txq *q);
+
+void t4_read_pace_tbl(struct adapter *adap, unsigned int pace_vals[NTX_SCHED]);
+void t4_get_tx_sched(struct adapter *adap, unsigned int sched,
+		     unsigned int *kbps, unsigned int *ipg, bool sleep_ok);
+int t4_sge_ctxt_rd_bd(struct adapter *adap, unsigned int cid,
+		      enum ctxt_type ctype, u32 *data);
+int t4_get_scfg_version(struct adapter *adapter, u32 *vers);
+int t4_get_vpd_version(struct adapter *adapter, u32 *vers);
+int t4_flash_erase_sectors(struct adapter *adapter, int start, int end);
+int t4_write_flash(struct adapter *adapter, unsigned int addr,
+		   unsigned int n, const u8 *data, int byte_oriented);
+int get_flash_params(struct adapter *adap);
+void t4_tp_pio_read(struct adapter *adap, u32 *buff, u32 nregs,
+		    u32 start_index, bool sleep_ok);
+void t4_tp_pio_write(struct adapter *adap, u32 *buff, u32 nregs,
+		     u32 start_index, bool sleep_ok);
+void t4_tp_tm_pio_read(struct adapter *adap, u32 *buff, u32 nregs,
+		       u32 start_index, bool sleep_ok);
+void t4_tp_mib_read(struct adapter *adap, u32 *buff, u32 nregs,
+		    u32 start_index, bool sleep_ok);
 #endif /* __CXGB4_H__ */
